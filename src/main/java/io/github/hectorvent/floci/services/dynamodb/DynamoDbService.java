@@ -664,11 +664,22 @@ public class DynamoDbService implements ResourceProvider {
     }
 
     public JsonNode getItem(String tableName, JsonNode key, String region) {
+        return getItem(tableName, key, region, KeySurface.KEY_ARGUMENT);
+    }
+
+    // Reads the image stored behind a write request. The caller hands in the item body it
+    // is about to write rather than a caller-supplied Key, so the key-argument rules — an
+    // extra attribute is rejected there — must not apply.
+    public JsonNode getStoredImage(String tableName, JsonNode keyOrItem, String region) {
+        return getItem(tableName, keyOrItem, region, KeySurface.ITEM_BODY);
+    }
+
+    private JsonNode getItem(String tableName, JsonNode key, String region, KeySurface surface) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
         var table = requireActiveTable(storageKey, canonicalTableName);
 
-        String itemKey = buildItemKey(table, key, true);
+        String itemKey = buildItemKey(table, key, surface);
         var items = currentItems(storageKey, false);
         if (items == null) {
             LOG.tracev("Got item from {0}: key={1} item=<not found>", canonicalTableName, itemKey);
@@ -1280,14 +1291,14 @@ public class DynamoDbService implements ResourceProvider {
                     }
                     JsonNode normalizedItem = DynamoDbNumberUtils.normalizeNumbersInItem(item);
                     DynamoDbItemSize.validateSize(normalizedItem);
-                    itemKey = buildItemKey(table, normalizedItem, KeySurface.BATCH_WRITE);
+                    itemKey = buildItemKey(table, normalizedItem, KeySurface.BATCH_WRITE_ITEM);
                     validateIndexKeyTypes(table, normalizedItem, false);
                 } else if (writeRequest.has("DeleteRequest")) {
                     JsonNode key = writeRequest.get("DeleteRequest").get("Key");
                     if (key == null) {
                         throw new AwsException("ValidationException", "Key is required for DeleteRequest", 400);
                     }
-                    itemKey = buildItemKey(table, key, KeySurface.BATCH_WRITE);
+                    itemKey = buildItemKey(table, key, KeySurface.BATCH_WRITE_KEY);
                 } else {
                     continue;
                 }
@@ -1764,7 +1775,8 @@ public class DynamoDbService implements ResourceProvider {
                     if ("ValidationException".equals(e.getErrorCode())) {
                         hasCancelled = true;
                         results.add(null);
-                        cancelReasons.add(new TransactionCanceledException.CancellationReason("ValidationError", null));
+                        cancelReasons.add(new TransactionCanceledException.CancellationReason(
+                                "ValidationError", null, e.getMessage()));
                     } else {
                         throw e;
                     }
@@ -3230,7 +3242,21 @@ public class DynamoDbService implements ResourceProvider {
     // AWS words a key rejection by the surface the key arrived on. A PutItem item body
     // names the mismatched types, a Key argument and a BatchWriteItem entry report a
     // schema mismatch instead. An empty key value is worded the same on every surface.
-    enum KeySurface { ITEM_BODY, KEY_ARGUMENT, BATCH_WRITE }
+    // A Key argument also carries the key and nothing else, so AWS rejects any extra
+    // attribute on it; an item body is expected to carry the rest of the item.
+    enum KeySurface {
+        ITEM_BODY(false), KEY_ARGUMENT(true), BATCH_WRITE_ITEM(false), BATCH_WRITE_KEY(true);
+
+        private final boolean keyOnly;
+
+        KeySurface(boolean keyOnly) {
+            this.keyOnly = keyOnly;
+        }
+
+        boolean isKeyOnly() {
+            return keyOnly;
+        }
+    }
 
     String buildItemKey(TableDefinition table, JsonNode item) {
         return buildItemKey(table, item, KeySurface.ITEM_BODY);
@@ -3242,6 +3268,15 @@ public class DynamoDbService implements ResourceProvider {
 
     String buildItemKey(TableDefinition table, JsonNode item, KeySurface surface) {
         String pkName = table.getPartitionKeyName();
+        String skName = table.getSortKeyName();
+        if (surface.isKeyOnly()) {
+            // AWS validates the wire shape of every member of a Key argument, extra
+            // attributes included, before it looks at the schema, so a malformed extra
+            // attribute is reported ahead of the extra attribute itself.
+            for (JsonNode attr : item) {
+                validateAttributeValueShape(attr);
+            }
+        }
         JsonNode pkAttr = item.get(pkName);
         if (pkAttr == null) {
             throw missingKeyException(surface);
@@ -3250,7 +3285,7 @@ public class DynamoDbService implements ResourceProvider {
         validateKeySize(pkAttr, true);
 
         String pk = encodeKeySegment(extractScalarValue(pkAttr));
-        String skName = table.getSortKeyName();
+        String itemKey = pk;
         if (skName != null) {
             JsonNode skAttr = item.get(skName);
             if (skAttr == null) {
@@ -3258,9 +3293,25 @@ public class DynamoDbService implements ResourceProvider {
             }
             validateKeyAttributeValue(table, skAttr, skName, surface);
             validateKeySize(skAttr, false);
-            return pk + "#" + encodeKeySegment(extractScalarValue(skAttr));
+            itemKey = pk + "#" + encodeKeySegment(extractScalarValue(skAttr));
         }
-        return pk;
+        if (surface.isKeyOnly()) {
+            rejectExtraKeyAttributes(item, pkName, skName);
+        }
+        return itemKey;
+    }
+
+    // A Key argument may name the key attributes and nothing else. AWS rejects an extra
+    // attribute with the same wording it uses for a missing or mistyped key element, and
+    // does so after the key attributes themselves have been validated.
+    private void rejectExtraKeyAttributes(JsonNode key, String pkName, String skName) {
+        Iterator<String> names = key.fieldNames();
+        while (names.hasNext()) {
+            String name = names.next();
+            if (!name.equals(pkName) && !name.equals(skName)) {
+                throw new KeySchemaMismatchException("The provided key element does not match the schema");
+            }
+        }
     }
 
     // '#' separates composite key segments in the in-memory map. Escape it and the escape
