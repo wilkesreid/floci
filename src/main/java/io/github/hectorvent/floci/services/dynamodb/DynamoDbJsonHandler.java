@@ -443,7 +443,7 @@ public class DynamoDbJsonHandler {
         JsonNode oldItem = null;
         if ("ALL_OLD".equals(returnValues) || expected != null) {
             dynamoDbService.describeTable(tableName, region);
-            oldItem = dynamoDbService.getItem(tableName, item, region);
+            oldItem = dynamoDbService.getStoredImage(tableName, item, region);
         }
 
         if (expected != null) {
@@ -1220,11 +1220,13 @@ public class DynamoDbJsonHandler {
             TableDefinition bwTable = dynamoDbService.describeTable(entry.getKey(), region);
             Set<String> seen = new HashSet<>();
             for (JsonNode writeReq : entry.getValue()) {
-                JsonNode keyNode = writeReq.has("PutRequest")
+                boolean isPutReq = writeReq.has("PutRequest");
+                JsonNode keyNode = isPutReq
                         ? writeReq.get("PutRequest").get("Item")
                         : writeReq.get("DeleteRequest").get("Key");
                 String key = dynamoDbService.buildItemKey(bwTable, keyNode,
-                        DynamoDbService.KeySurface.BATCH_WRITE);
+                        isPutReq ? DynamoDbService.KeySurface.BATCH_WRITE_ITEM
+                                 : DynamoDbService.KeySurface.BATCH_WRITE_KEY);
                 if (!seen.add(key)) {
                     throw new AwsException("ValidationException",
                             "Provided list of item keys contains duplicates", 400);
@@ -1253,7 +1255,7 @@ public class DynamoDbJsonHandler {
                     var keyNode = writeReq.has("PutRequest")
                             ? writeReq.get("PutRequest").get("Item")
                             : writeReq.get("DeleteRequest").get("Key");
-                    var previous = dynamoDbService.getItem(entry.getKey(), keyNode, region);
+                    var previous = dynamoDbService.getStoredImage(entry.getKey(), keyNode, region);
                     cost = cost.plus(DynamoDbWriteCapacity.forWrite(costTable, previous, newItem));
                 }
                 costs.put(entry.getKey(), cost);
@@ -1849,7 +1851,8 @@ public class DynamoDbJsonHandler {
                 ObjectNode r = objectMapper.createObjectNode();
                 r.put("Code", reason.code().isEmpty() ? "None" : reason.code());
                 if (!reason.code().isEmpty()) {
-                    r.put("Message", "");
+                    // AWS reports the validation error that cancelled the member here.
+                    r.put("Message", reason.message() != null ? reason.message() : "");
                 }
                 if (reason.item() != null) {
                     r.set("Item", reason.item());
